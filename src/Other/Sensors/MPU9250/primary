@@ -128,5 +128,5 @@ void loop() {
   Serial.print(yaw, 2);
   Serial.println("°");
 
-  delay(250);
+  delay(250); 
 }
