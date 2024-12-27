@@ -1,0 +1,131 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
+#include <esp_now.h>
+#include <string.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <string.h>
+
+// -------------------- Pin Configuration ----------------we----
+const int POWER_PIN = 25;   // This pin is set HIGH by default
+const int MOTOR_FWD_PIN = 21;
+const int MOTOR_BWD_PIN = 22;
+
+// -------------------- Direction Control Variable --------------------
+bool reverseMotor = true; // Set true if wiring requires reversing up/down logic
+
+// -------------------- Speed Control --------------------
+const int MAX_PWM = 255;
+const int ACTIVE_PWM = 200; // ~170
+
+// -------------------- Command Flags --------------------
+bool upCmd = false;
+bool downCmd = false;
+
+// Callback when data is received via ESP-NOW
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    if (len <= 0) return;
+
+    char buffer[256];
+    int copyLen = (len < 255) ? len : 255;
+    memcpy(buffer, incomingData, copyLen);
+    buffer[copyLen] = '\0';
+
+    char *line = strtok(buffer, "\r\n");
+    while (line != NULL) {
+        if (strncmp(line, "Navigation:", 11) == 0) {
+            int fwd, bwd, lft, rgt, up, dwn;
+            int matched = sscanf(line, "Navigation: forward=%d backward=%d left=%d right=%d up=%d down=%d",
+                                 &fwd, &bwd, &lft, &rgt, &up, &dwn);
+            if (matched == 6) {
+                upCmd = (up != 0);
+                downCmd = (dwn != 0);
+
+                // Print out the commands received
+                Serial.println("Received Control Commands:");
+                Serial.print("Up: "); Serial.println(upCmd ? "ON" : "OFF");
+                Serial.print("Down: "); Serial.println(downCmd ? "ON" : "OFF");
+            }
+        }
+        line = strtok(NULL, "\r\n");
+    }
+}
+
+void setMotorDirectionAndSpeed(bool up, bool down, bool reverse) {
+    int forwardVal = 0;
+    int backwardVal = 0;
+
+    // Determine direction based on up/down
+    // If reverseMotor is true, up/down logic is swapped
+    bool motorForward = up;
+    bool motorBackward = down;
+    if (reverse) {
+        motorForward = down;   // Reversed: up command means backward
+        motorBackward = up;    // Reversed: down command means forward
+    }
+
+    // Decide PWM values
+    if (motorForward && !motorBackward) {
+        forwardVal = ACTIVE_PWM;
+        backwardVal = 0;
+    } else if (motorBackward && !motorForward) {
+        forwardVal = 0;
+        backwardVal = ACTIVE_PWM;
+    } else {
+        // No command or conflicting command => stop
+        forwardVal = 0;
+        backwardVal = 0;
+    }
+
+    ledcWrite(0, forwardVal);
+    ledcWrite(1, backwardVal);
+}
+
+void setupPinsAndPWMs() {
+  // Set power pin HIGH by default
+  pinMode(POWER_PIN, OUTPUT);
+  digitalWrite(POWER_PIN, HIGH);
+
+  // Set PWM pins as outputs
+  pinMode(MOTOR_FWD_PIN, OUTPUT);
+  pinMode(MOTOR_BWD_PIN, OUTPUT);
+
+  // Setup LEDC channels for the motor
+  ledcSetup(0, 5000, 8); // Forward channel
+  ledcSetup(1, 5000, 8); // Backward channel
+
+  ledcAttachPin(MOTOR_FWD_PIN, 0);
+  ledcAttachPin(MOTOR_BWD_PIN, 1);
+
+  // Initially stop the motor
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  setupPinsAndPWMs();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.print("Slave MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("ESP-NOW Slave ready...");
+}
+
+void loop() {
+  // Just respond to commands immediately, no ramp
+  setMotorDirectionAndSpeed(upCmd, downCmd, reverseMotor);
+  delay(1); // small delay to avoid flooding the CPU
+}
