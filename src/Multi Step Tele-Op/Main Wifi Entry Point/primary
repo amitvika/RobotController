@@ -1,16 +1,6 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <ArduinoWebsockets.h>
-#include <ArduinoJson.h>
-#include <Arduino.h>
-#include <WiFi.h>
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <ArduinoWebsockets.h>
-#include <ArduinoJson.h>
-
+ 
+ #include <Adafruit_BusIO_Register.h>
+  #include <Adafruit_Sensor.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -93,7 +83,7 @@ void setup() {
 
     unsigned long wifiConnectStart = millis();
     while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - wifiConnectStart > 5000) {
+        if (millis() - wifiConnectStart > 2000) {
             Serial.println("\nFailed to connect Wi-Fi, restarting...");
             ESP.restart();
         }

@@ -1,82 +1,112 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
-#include <esp_now.h>
-#include <string.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <string.h>
 
-// -------------------- Pin Configuration ----------------we----
-const int POWER_PIN = 25;   // This pin is set HIGH by default
+// -------------------- Pin Configuration --------------------
+const int POWER_PIN     = 25; // This pin is set HIGH by default
 const int MOTOR_FWD_PIN = 21;
 const int MOTOR_BWD_PIN = 22;
 
 // -------------------- Direction Control Variable --------------------
-bool reverseMotor = true; // Set true if wiring requires reversing up/down logic
+bool reverseMotor = true; // If wiring requires reversing up/down logic
 
 // -------------------- Speed Control --------------------
-const int MAX_PWM = 255;
-const int ACTIVE_PWM = 200; // ~170
+const int MAX_PWM    = 255;
+const int ACTIVE_PWM = 200; // ~170–200
 
 // -------------------- Command Flags --------------------
-bool upCmd = false;
+bool upCmd   = false;
 bool downCmd = false;
 
-// Callback when data is received via ESP-NOW
+// ------------------------------------------------------------------
+// parseKeyValueLine: "markerId=hands;up=1;down=0;..."
+//
+// We'll ignore everything except "up=..." and "down=..." for controlling
+// the motor. If you want to parse more fields, you can extend this function.
+// ------------------------------------------------------------------
+void parseKeyValueLine(char* line) {
+    // Split by semicolons
+    char* token = strtok(line, ";");
+    while (token != NULL) {
+        // Look for '='
+        char* eqPos = strchr(token, '=');
+        if (eqPos) {
+            *eqPos = '\0';     // Split
+            char* key = token;
+            char* val = eqPos + 1;
+
+            // Compare keys
+            if (!strcmp(key, "up")) {
+                upCmd   = (atoi(val) == 1);
+            } else if (!strcmp(key, "down")) {
+                downCmd = (atoi(val) == 1);
+            }
+        }
+        token = strtok(NULL, ";");
+    }
+
+    // Debug (optional)
+    Serial.print("Commands => up=");
+    Serial.print(upCmd);
+    Serial.print(", down=");
+    Serial.println(downCmd);
+}
+
+// ------------------------------------------------------------------
+// ESPNOW receive callback
+// ------------------------------------------------------------------
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
     if (len <= 0) return;
 
+    // Copy to a buffer for parsing
     char buffer[256];
     int copyLen = (len < 255) ? len : 255;
     memcpy(buffer, incomingData, copyLen);
     buffer[copyLen] = '\0';
 
-    char *line = strtok(buffer, "\r\n");
-    while (line != NULL) {
-        if (strncmp(line, "Navigation:", 11) == 0) {
-            int fwd, bwd, lft, rgt, up, dwn;
-            int matched = sscanf(line, "Navigation: forward=%d backward=%d left=%d right=%d up=%d down=%d",
-                                 &fwd, &bwd, &lft, &rgt, &up, &dwn);
-            if (matched == 6) {
-                upCmd = (up != 0);
-                downCmd = (dwn != 0);
-
-                // Print out the commands received
-                Serial.println("Received Control Commands:");
-                Serial.print("Up: "); Serial.println(upCmd ? "ON" : "OFF");
-                Serial.print("Down: "); Serial.println(downCmd ? "ON" : "OFF");
-            }
-        }
-        line = strtok(NULL, "\r\n");
-    }
+    // We'll parse the entire buffer as one line
+    parseKeyValueLine(buffer);
 }
 
+// ------------------------------------------------------------------
+// Motor direction + speed
+// ------------------------------------------------------------------
 void setMotorDirectionAndSpeed(bool up, bool down, bool reverse) {
-    int forwardVal = 0;
+    int forwardVal  = 0;
     int backwardVal = 0;
 
-    // Determine direction based on up/down
-    // If reverseMotor is true, up/down logic is swapped
-    bool motorForward = up;
+    // Decide direction
+    bool motorForward  = up;
     bool motorBackward = down;
     if (reverse) {
-        motorForward = down;   // Reversed: up command means backward
-        motorBackward = up;    // Reversed: down command means forward
+        motorForward  = down;
+        motorBackward = up;
     }
 
-    // Decide PWM values
     if (motorForward && !motorBackward) {
-        forwardVal = ACTIVE_PWM;
+        forwardVal  = ACTIVE_PWM;
         backwardVal = 0;
-    } else if (motorBackward && !motorForward) {
-        forwardVal = 0;
+    } 
+    else if (motorBackward && !motorForward) {
+        forwardVal  = 0;
         backwardVal = ACTIVE_PWM;
-    } else {
-        // No command or conflicting command => stop
-        forwardVal = 0;
+    } 
+    else {
+        // Stop
+        forwardVal  = 0;
         backwardVal = 0;
     }
 
@@ -84,23 +114,26 @@ void setMotorDirectionAndSpeed(bool up, bool down, bool reverse) {
     ledcWrite(1, backwardVal);
 }
 
+// ------------------------------------------------------------------
+// Setup pins and PWM
+// ------------------------------------------------------------------
 void setupPinsAndPWMs() {
-  // Set power pin HIGH by default
+  // Power pin
   pinMode(POWER_PIN, OUTPUT);
   digitalWrite(POWER_PIN, HIGH);
 
-  // Set PWM pins as outputs
+  // PWM pins
   pinMode(MOTOR_FWD_PIN, OUTPUT);
   pinMode(MOTOR_BWD_PIN, OUTPUT);
 
-  // Setup LEDC channels for the motor
-  ledcSetup(0, 5000, 8); // Forward channel
-  ledcSetup(1, 5000, 8); // Backward channel
+  // Setup LEDC channels for forward/back
+  ledcSetup(0, 5000, 8); // forward channel
+  ledcSetup(1, 5000, 8); // backward channel
 
   ledcAttachPin(MOTOR_FWD_PIN, 0);
   ledcAttachPin(MOTOR_BWD_PIN, 1);
 
-  // Initially stop the motor
+  // Initially stop
   ledcWrite(0, 0);
   ledcWrite(1, 0);
 }
@@ -110,6 +143,7 @@ void setup() {
 
   setupPinsAndPWMs();
 
+  // Wi-Fi not used for normal connection here, but needed for ESP-NOW
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
@@ -125,7 +159,9 @@ void setup() {
 }
 
 void loop() {
-  // Just respond to commands immediately, no ramp
+  // Just respond to commands in real-time, no ramping logic here
   setMotorDirectionAndSpeed(upCmd, downCmd, reverseMotor);
-  delay(1); // small delay to avoid flooding the CPU
+
+  // Minimal loop delay
+  delay(1);
 }

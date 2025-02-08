@@ -23,8 +23,8 @@ bool reverseMotor2   = false;
 bool swapLeftRight   = true; // swap the left & right commands if desired
 
 // Speeds
-static const int MOTOR_SPEED = 200;   // max speed
-static const int MIN_PWM     = 100;   // deadzone
+static const int MOTOR_SPEED = 250;   // max speed
+static const int MIN_PWM     = 150;   // deadzone
 float currentSpeed           = 0.0f;  // current motor speed
 unsigned long lastUpdateTime = 0;
 
