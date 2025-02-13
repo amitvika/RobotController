@@ -17,27 +17,30 @@
 #include <Adafruit_Sensor.h>
 
 //----------------------------------------------------------------------
-// Expected UART string format received from Python:
-// mac=;h1X=0;h1Y=0;h1Z=0;h1P=0;h1Y=0;h1R=0;h2X=0;h2Y=0;h2Z=0;h2P=0;h2Y=0;h2R=0;f=0;b=0;l=0;r=0;u=0;d=0
+// Uncomment the following line to use UART communication (e.g. with an external
+// device connected to Serial1). Comment it out to use the USB serial (Serial)
+// for communication with a computer.
 //----------------------------------------------------------------------
+//#define COMM_MODE_UART
 
-// ------------------- UART CONFIG -------------------
-#define UART_BAUD_RATE   115200  // Adjust if needed
-#define MAX_LINE_LENGTH  256
+// ------------------- Communication Config -------------------
+#ifdef COMM_MODE_UART
+  #define UART_BAUD_RATE   115200  // Adjust as needed
+  #define MAX_LINE_LENGTH  256
+  // Define UART1 TX/RX pins (adjust according to your wiring)
+  #define UART_TX_PIN 17
+  #define UART_RX_PIN 16
+#endif
 
-// Define UART1 TX/RX pins (Adjust these as per your wiring)
-#define UART_TX_PIN 17
-#define UART_RX_PIN 16
+// Create a pointer for the communication port (either Serial1 or Serial)
+Stream* commPort;
 
 // ------------------- SLAVE MAC ADDRESSES --------------------
-// (Replace or adjust these MAC addresses as needed.)
-// ------------------- SLAVE MAC ADDRESSES --------------------
-// (Replace or adjust these MAC addresses as needed.)
+// (Replace these MAC addresses as needed)
 uint8_t slave1MAC[] = {0x78, 0xEE, 0x4C, 0x11, 0x31, 0x8C}; // wheels
 uint8_t slave2MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x00}; // neck
 uint8_t slave3MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x64}; // neck
 uint8_t slave4MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x68}; // IK arm 1, actuator 6
-//f8:b3:b7:d2:3b:54// IK arm 1, actuator 2
 uint8_t slave5MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x54}; // IK arm 1, actuator 2
 uint8_t slave6MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
 uint8_t slave7MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
@@ -60,31 +63,37 @@ bool peerAdded[numSlaves] = { false };
 
 // ------------------- ESPNOW CALLBACK ----------------
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Optionally, add code here if you need to track success/failure.
+  // Optionally, add code here if you need to track success or failure.
 }
 
 // ------------------- SETUP --------------------------
 void setup() {
-  // Initialize UART1 for communication with Raspberry Pi (or other UART device)
-  Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);  // Baud rate, data bits, stop bits, pins
-  
-  // Allow some time for the serial connection to initialize
+  // Initialize the chosen communication port:
+  #ifdef COMM_MODE_UART
+    Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    commPort = &Serial1;
+  #else
+    Serial.begin(115200);
+    commPort = &Serial;
+  #endif
+
+  // Allow some time for the serial connection to initialize.
   delay(100);
 
-  // Set Wi-Fi mode to STA and disable power saving for low-latency ESPNOW
+  // Set Wi-Fi mode to STA and disable power saving for low-latency ESPNOW.
   WiFi.mode(WIFI_STA);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.disconnect();
 
-  // Initialize ESPNOW
+  // Initialize ESPNOW.
   if (esp_now_init() == ESP_OK) {
     esp_now_register_send_cb(onDataSent);
 
-    // Add each slave as an ESPNOW peer
+    // Add each slave as an ESPNOW peer.
     for (int i = 0; i < numSlaves; i++) {
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, slaves[i], 6);
-      peerInfo.channel = 0;   // Use the same channel as the master
+      peerInfo.channel = 0;   // Use the same channel as the master.
       peerInfo.encrypt = false;
 
       if (esp_now_add_peer(&peerInfo) == ESP_OK) {
@@ -92,26 +101,31 @@ void setup() {
       }
     }
   } else {
-    Serial1.println("Error initializing ESPNOW");
+    commPort->println("Error initializing ESPNOW");
   }
 }
 
 // ------------------- MAIN LOOP ----------------------
 void loop() {
-  static char buffer[MAX_LINE_LENGTH];
+  // Define a buffer for incoming data.
+  #ifdef COMM_MODE_UART
+    static char buffer[MAX_LINE_LENGTH];
+  #else
+    static char buffer[256];
+  #endif
   static int idx = 0;
 
-  // Continuously check if data is available on UART1 (for communication with Raspberry Pi)
-  while (Serial1.available() > 0) {
-    char c = (char)Serial1.read();
+  // Continuously check if data is available on the chosen communication port.
+  while (commPort->available() > 0) {
+    char c = (char)commPort->read();
 
     if (c == '\n') {
       // End-of-line received. Terminate the string.
       buffer[idx] = '\0';
 
-      // Echo the received string back over UART1 so that the Python script can display it.
-      Serial1.write(buffer);
-      Serial1.write("\n");
+      // Echo the received string back so the sender can see it.
+      commPort->print(buffer);
+      commPort->print("\n");
 
       // Send the received data via ESPNOW to all configured peers.
       if (idx > 0) {
@@ -126,7 +140,7 @@ void loop() {
     } 
     else {
       // Accumulate incoming characters until a newline is encountered.
-      if (idx < MAX_LINE_LENGTH - 1) {
+      if (idx < (int)(sizeof(buffer) - 1)) {
         buffer[idx++] = c;
       } else {
         // If the buffer overflows, reset the index.
@@ -134,5 +148,5 @@ void loop() {
       }
     }
   }
-  // The loop runs continuously with no added delay.
+  // Loop continuously without delay.
 }

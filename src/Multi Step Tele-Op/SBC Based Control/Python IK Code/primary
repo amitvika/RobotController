@@ -1,0 +1,314 @@
+import math
+import sys
+import numpy as np
+from vpython import canvas, sphere, cylinder, vector, color, rate, curve, arrow, slider, wtext
+from ikpy.chain import Chain
+from ikpy.link import OriginLink, DHLink
+import serial
+from numba import jit
+
+#############################################################################
+# CONFIGURATION FLAGS
+#############################################################################
+# Set to False to disable heavy visualization (robot drawing, FK calculations, etc.)
+ENABLE_VISUALIZATION = False
+# Set to False to disable printing to the Python output (serial data is still sent)
+ENABLE_PRINTING = True
+
+#############################################################################
+# Global constants & local references (using float32 where possible)
+#############################################################################
+PI = math.pi
+TWO_PI = 2.0 * PI
+RAD_TO_12BIT_SCALE = 4095.0 / TWO_PI
+
+# Cache frequently used math functions
+_cos = math.cos
+_sin = math.sin
+_radians = math.radians
+
+#############################################################################
+# 1) Robot chain definition (UR10 D-H parameters) with efficient data types
+#############################################################################
+def identity_transform():
+    return np.eye(4, dtype=np.float32)
+
+robot_chain = Chain(
+    name="ur10_chain",
+    links=[
+        OriginLink(),
+        DHLink(name="joint1", d=0.1273,  a=0.0,     alpha= PI/2),
+        DHLink(name="joint2", d=0.0,     a=-0.612,  alpha=0.0),
+        DHLink(name="joint3", d=0.0,     a=-0.5723, alpha=0.0),
+        DHLink(name="joint4", d=0.163941,a=0.0,     alpha= PI/2),
+        DHLink(name="joint5", d=0.1157,  a=0.0,     alpha=-PI/2),
+        DHLink(name="joint6", d=0.0922,  a=0.0,     alpha=0.0),
+    ],
+    base_frame=identity_transform()
+)
+
+#############################################################################
+# 2) Helper functions for IK and FK with efficient data types and JIT compilation
+#############################################################################
+def rad_to_12bit(angle_rad):
+    """Convert a radian angle to a 12-bit value [0,4095] mapping 0..2π -> 0..4095."""
+    angle_wrapped = angle_rad % TWO_PI
+    val = int(round(angle_wrapped * RAD_TO_12BIT_SCALE))
+    return 4095 if val > 4095 else (0 if val < 0 else val)
+
+@jit(nopython=True)
+def rpy_to_matrix_jit(roll_deg, pitch_deg, yaw_deg):
+    """
+    JIT-compiled function to compute the rotation matrix from roll, pitch, yaw (in degrees).
+    Returns a 3x3 matrix of dtype float32.
+    """
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+    cr = math.cos(r)
+    sr = math.sin(r)
+    cp = math.cos(p)
+    sp = math.sin(p)
+    cy = math.cos(y)
+    sy = math.sin(y)
+    out = np.empty((3, 3), dtype=np.float32)
+    out[0, 0] = cy * cp
+    out[0, 1] = cy * sp * sr - sy * cr
+    out[0, 2] = cy * sp * cr + sy * sr
+    out[1, 0] = sy * cp
+    out[1, 1] = sy * sp * sr + cy * cr
+    out[1, 2] = sy * sp * cr - cy * sr
+    out[2, 0] = -sp
+    out[2, 1] = cp * sr
+    out[2, 2] = cp * cr
+    return out
+
+def inverse_kinematics(chain, px, py, pz, roll_deg, pitch_deg, yaw_deg, q_init):
+    """Solve IK and return joint angles (in rad)."""
+    # Create target position as float32
+    target_pos = np.array([px, py, pz], dtype=np.float32)
+    # Use the JIT-compiled rotation matrix. (Cast to float64 if IKpy requires it.)
+    target_rot = rpy_to_matrix_jit(roll_deg, pitch_deg, yaw_deg).astype(np.float64)
+    init_guess = [0] + list(q_init)
+    sol = chain.inverse_kinematics(
+        target_position=target_pos,
+        target_orientation=target_rot,
+        initial_position=init_guess,
+        orientation_mode="all"
+    )
+    return sol[1:]
+
+def forward_kinematics(chain, q):
+    """Compute forward kinematics to get joint positions and end-effector transform."""
+    transforms = chain.forward_kinematics([0] + list(q), full_kinematics=True)
+    positions = [vector(t[0, 3], t[1, 3], t[2, 3]) for t in transforms]
+    end_tf = transforms[-1]
+    return positions, end_tf
+
+#############################################################################
+# 3) VPython UI Setup (Canvas and Sliders)
+#############################################################################
+scene = canvas(title="UR10 Actuator Sliders and Joint Angles", width=900, height=600,
+               background=color.white)
+if ENABLE_VISUALIZATION:
+    scene.center = vector(0.3, 0, 0.2)
+    scene.forward = vector(0, -0.01, -1)
+
+# Create visualization objects only if enabled.
+if ENABLE_VISUALIZATION:
+    def draw_grid(xmin, xmax, ymin, ymax, z=0, spacing=0.1):
+        gridlines = []
+        x = xmin
+        while x <= xmax + 1e-9:
+            gridlines.append(curve(pos=[vector(x, ymin, z), vector(x, ymax, z)], color=color.gray(0.7)))
+            x += spacing
+        y = ymin
+        while y <= ymax + 1e-9:
+            gridlines.append(curve(pos=[vector(xmin, y, z), vector(xmax, y, z)], color=color.gray(0.7)))
+            y += spacing
+        return gridlines
+
+    grid = draw_grid(-1, 1, -1, 1, 0, 0.1)
+
+    joint_spheres = [sphere(radius=0.03, color=color.red) for _ in range(7)]
+    link_cylinders = [cylinder(radius=0.015, color=color.blue) for _ in range(6)]
+
+    def update_robot(positions):
+        for i, pos in enumerate(positions):
+            joint_spheres[i].pos = pos
+        for i in range(len(positions) - 1):
+            link_cylinders[i].pos = positions[i]
+            link_cylinders[i].axis = positions[i+1] - positions[i]
+
+    arrow_x = arrow(color=color.red, shaftwidth=0.004)
+    arrow_y = arrow(color=color.green, shaftwidth=0.004)
+    arrow_z = arrow(color=color.blue, shaftwidth=0.004)
+
+    def update_ee_arrows(transform):
+        pos = vector(transform[0, 3], transform[1, 3], transform[2, 3])
+        R = transform[0:3, 0:3]
+        x_dir = vector(R[0, 0], R[1, 0], R[2, 0])
+        y_dir = vector(R[0, 1], R[1, 1], R[2, 1])
+        z_dir = vector(R[0, 2], R[1, 2], R[2, 2])
+        scale = 0.08
+        arrow_x.pos = pos
+        arrow_y.pos = pos
+        arrow_z.pos = pos
+        arrow_x.axis = x_dir * scale
+        arrow_y.axis = y_dir * scale
+        arrow_z.axis = z_dir * scale
+
+    target_x = arrow(color=color.gray(0.5), shaftwidth=0.004)
+    target_y = arrow(color=color.gray(0.5), shaftwidth=0.004)
+    target_z = arrow(color=color.gray(0.5), shaftwidth=0.004)
+
+    def update_target_arrows(px, py, pz, roll_deg, pitch_deg, yaw_deg):
+        pos = vector(px, py, pz)
+        sc = 0.06
+        target_x.pos = pos
+        target_y.pos = pos
+        target_z.pos = pos
+        target_x.axis = vector(1, 0, 0) * sc
+        target_y.axis = vector(0, 1, 0) * sc
+        target_z.axis = vector(0, 0, 1) * sc
+
+# Create slider UI (always active)
+scene.append_to_caption("\n=== UR10 Sliders (12-bit output) ===\n\n")
+scene.append_to_caption("x: ")
+text_x = wtext(text="0.00 ")
+slider_x = slider(min=-0.5, max=0.5, value=0.0, step=0.01,
+                  bind=lambda s: text_x.__setattr__("text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("y: ")
+text_y = wtext(text="0.00 ")
+slider_y = slider(min=-0.5, max=0.5, value=0.0, step=0.01,
+                  bind=lambda s: text_y.__setattr__("text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("z: ")
+text_z = wtext(text="0.30 ")
+slider_z = slider(min=0.0, max=1.0, value=0.3, step=0.01,
+                  bind=lambda s: text_z.__setattr__("text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("roll (deg): ")
+text_roll = wtext(text="0 ")
+slider_roll = slider(min=-180, max=180, value=0, step=1,
+                     bind=lambda s: text_roll.__setattr__("text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("pitch (deg): ")
+text_pitch = wtext(text="0 ")
+slider_pitch = slider(min=-180, max=180, value=0, step=1,
+                      bind=lambda s: text_pitch.__setattr__("text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("yaw (deg): ")
+text_yaw = wtext(text="0 ")
+slider_yaw = slider(min=-180, max=180, value=0, step=1,
+                    bind=lambda s: text_yaw.__setattr__("text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("=== Joint Angles (12-bit) ===\n\n")
+joint_texts = [wtext(text=f"J{i+1} = 0\n") for i in range(6)]
+
+#############################################################################
+# 4) Initialization and (optional) Visualization
+#############################################################################
+# Use float32 for current_q if high precision is not needed.
+current_q = np.zeros(6, dtype=np.float32)
+if ENABLE_VISUALIZATION:
+    pos_list, end_tf = forward_kinematics(robot_chain, current_q)
+    update_robot(pos_list)
+    update_ee_arrows(end_tf)
+
+#############################################################################
+# 5) Initialize UART / Serial
+#############################################################################
+try:
+    ser = serial.Serial(port='COM7', baudrate=115200, timeout=0.01)
+    if ENABLE_PRINTING:
+        print("Serial port opened successfully.")
+except Exception as e:
+    ser = None
+    if ENABLE_PRINTING:
+        print("Warning: Could not open serial port COM7.", e)
+
+if ENABLE_PRINTING:
+    print("UR10 Arm loaded. Sliders control the target. IK will update 12-bit angles.\n")
+
+#############################################################################
+# 6) Main Loop
+#############################################################################
+prev_target = None
+
+try:
+    while True:
+        rate(20)  # ~20 Hz update rate
+
+        # Read slider values
+        px = slider_x.value
+        py = slider_y.value
+        pz = slider_z.value
+        rdeg = slider_roll.value
+        pdeg = slider_pitch.value
+        ydeg = slider_yaw.value
+
+        # Create a target tuple for change detection
+        target = (px, py, pz, rdeg, pdeg, ydeg)
+        if prev_target is None or any(abs(t - pt) > 1e-6 for t, pt in zip(target, prev_target)):
+            prev_target = target
+
+            # Update target arrows if visualization is enabled
+            if ENABLE_VISUALIZATION:
+                update_target_arrows(px, py, pz, rdeg, pdeg, ydeg)
+
+            # Solve IK (the most computationally expensive step)
+            new_q = inverse_kinematics(robot_chain, px, py, pz, rdeg, pdeg, ydeg, current_q)
+            current_q = new_q
+
+            # Update robot geometry and end-effector arrows if visualization is enabled
+            if ENABLE_VISUALIZATION:
+                pos_list, end_tf = forward_kinematics(robot_chain, current_q)
+                update_robot(pos_list)
+                update_ee_arrows(end_tf)
+
+            # Convert joint angles to 12-bit and update displayed text
+            joint_12bit = [rad_to_12bit(a) for a in current_q]
+            for i in range(6):
+                joint_texts[i].text = f"J{i+1} = {joint_12bit[i]:4d}\n"
+
+            # Send the 12-bit data via serial even if printing is disabled
+            if ser and ser.is_open:
+                data_str = (
+                    "mac=;" +
+                    "h1X={};".format(joint_12bit[0]) +
+                    "h1Y={};".format(joint_12bit[1]) +
+                    "h1Z={};".format(joint_12bit[2]) +
+                    "h1p={};".format(joint_12bit[3]) +
+                    "h1y={};".format(joint_12bit[4]) +
+                    "h1r={};".format(joint_12bit[5]) +
+                    "h2X=0;h2Y=0;h2Z=0;h2p=0;h2y=0;h2r=0;" +
+                    "f=0;b=0;l=0;r=0;u=0;d=0\n"
+                )
+                if ENABLE_PRINTING:
+                    print("Sending:", data_str)
+                ser.write(data_str.encode('utf-8'))
+
+        # Check for echoed data from the ESP32 (if any)
+        if ser and ser.is_open and ser.in_waiting:
+            try:
+                echoed = ser.readline().decode('utf-8').strip()
+                if echoed and ENABLE_PRINTING:
+                    print("Echoed from ESP32:", echoed)
+            except Exception as e:
+                if ENABLE_PRINTING:
+                    print("Error reading echoed data:", e)
+
+except KeyboardInterrupt:
+    if ENABLE_PRINTING:
+        print("Interrupted by user.")
+    if ser and ser.is_open:
+        ser.close()
+    sys.exit(0)
