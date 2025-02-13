@@ -16,18 +16,22 @@
 #include <math.h>
 #include <string.h>
 
+//INSTRUCTIONS
+//based on the motor direction, switch around the motor control pins
+//based on the actuator number, change the string key
+
 // ------------------------- PIN DEFINITIONS -------------------------
 #define SDA_PIN_SENSOR   21
 #define SCL_PIN_SENSOR   22
 #define MOTOR_CTRL_PIN1  14
 #define MOTOR_CTRL_PIN2  13
-#define MOTOR_ENABLE_PIN 12
-
+#define MOTOR_ENABLE_PIN 12 //12 on 5 off
 #define AS5600_ADDRESS   0x36
+#define ACTUATOR_CENTER 3661 //actuator 6
 
 // ---------------------- CONTROL PARAMETERS -------------------------
 // Initial motor setpoint (will be updated via received ESP-NOW data)
-uint16_t desiredPosition = 2000;
+uint16_t desiredPosition = ACTUATOR_CENTER;
 float kp = 0.5;
 int maxPWM = 255;
 int positionErrorAllowance = 1;
@@ -49,15 +53,34 @@ uint16_t readAS5600Angle() {
   return 0;
 }
 
+// ------------------ WRAP-AROUND DIFFERENCE FUNCTION ----------------
+// Ensures angular difference is in [-2048, 2047].
+int angleDifference(uint16_t currentAngle, uint16_t targetAngle) {
+  int diff = (int)targetAngle - (int)currentAngle;
+
+  // Since AS5600 is 12-bit => 4096 counts per revolution
+  // Wrap to range [-2048, 2047]:
+  if (diff > 2047) {
+    diff -= 4096; 
+  } else if (diff < -2048) {
+    diff += 4096;
+  }
+  return diff;
+}
+
 // ------------------ MOTOR CONTROL FUNCTIONS ------------------------
 // Compute a PWM output based on the error between current and desired positions.
 int computeTargetPWM(uint16_t currentPosition, uint16_t desiredPosition) {
-  int error = desiredPosition - currentPosition;
+  // Use the wrapped difference:
+  int error = angleDifference(currentPosition, desiredPosition);
+  
   if (abs(error) <= positionErrorAllowance) {
     return 0;
   }
+  
   int pwmValue = kp * error;
   pwmValue = constrain(pwmValue, -maxPWM, maxPWM);
+
   // Ensure the output exceeds the dead zone
   if (pwmValue > 0) {
     pwmValue = max(pwmValue, deadZone);
@@ -105,10 +128,9 @@ void setupPinsAndPWMs() {
 // ------------------- ESP-NOW RECEIVE CODE --------------------------
 #define MAX_BUFFER_SIZE 256
 
-// Forward declaration of our parsing function.
 void parseActuatorValueLine(char* line);
 
-// This callback is invoked when an ESP‑NOW packet is received.
+// Callback when an ESP‑NOW packet is received.
 void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
   if (len <= 0) return;
 
@@ -145,7 +167,7 @@ void parseActuatorValueLine(char* line) {
   }
 }
 
-// ------------------- ESP-NOW SETUP --------------------------
+// ------------------- ESP-NOW SETUP ---------------------------------
 void initESPNOW() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -172,13 +194,12 @@ void setup() {
 }
 
 // ------------------------------ LOOP -------------------------------
-// In the main loop, the sensor is read and the motor control loop is executed.
 void loop() {
   uint16_t angle = readAS5600Angle();
   int targetPWM  = computeTargetPWM(angle, desiredPosition);
   applyPWM(targetPWM);
 
-  // Debug output (sensor reading, current setpoint, and PWM value).
+  // Debug output: sensor reading, current setpoint, and PWM value.
   Serial.print("Angle: ");
   Serial.print(angle);
   Serial.print(" | Setpoint: ");

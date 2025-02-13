@@ -1,0 +1,220 @@
+import math
+import sys
+import numpy as np
+from vpython import canvas, slider, wtext, rate
+from ikpy.chain import Chain
+from ikpy.link import OriginLink, DHLink
+import serial
+
+#############################################################################
+# 1) Global constants & local references to speed up repeated lookups
+#############################################################################
+PI = math.pi
+TWO_PI = 2.0 * PI
+RAD_TO_12BIT_SCALE = 4095.0 / TWO_PI
+
+cos = math.cos
+sin = math.sin
+radians = math.radians
+
+#############################################################################
+# 2) Robot chain definition with UR10 D-H parameters
+#############################################################################
+robot_chain = Chain(
+    name="ur10_chain",
+    links=[
+        OriginLink(),
+        DHLink(name="joint1", d=0.1273,  a=0.0,     alpha= PI/2),
+        DHLink(name="joint2", d=0.0,     a=-0.612,  alpha=0.0),
+        DHLink(name="joint3", d=0.0,     a=-0.5723, alpha=0.0),
+        DHLink(name="joint4", d=0.163941,a=0.0,     alpha= PI/2),
+        DHLink(name="joint5", d=0.1157,  a=0.0,     alpha=-PI/2),
+        DHLink(name="joint6", d=0.0922,  a=0.0,     alpha=0.0),
+    ],
+    base_frame=np.eye(4)
+)
+
+#############################################################################
+# 3) Fast helper functions
+#############################################################################
+def rad_to_12bit(angle_rad):
+    """Convert radian angle to 12-bit [0..4095], 0..2π -> 0..4095."""
+    angle_wrapped = angle_rad % TWO_PI
+    val = int(round(angle_wrapped * RAD_TO_12BIT_SCALE))
+    # Ensure it stays within [0, 4095]
+    return 4095 if val > 4095 else (0 if val < 0 else val)
+
+def rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+    """Directly compute rotation matrix from roll, pitch, yaw in degrees."""
+    r = radians(roll_deg)
+    p = radians(pitch_deg)
+    y = radians(yaw_deg)
+    cr, sr = cos(r), sin(r)
+    cp, sp = cos(p), sin(p)
+    cy, sy = cos(y), sin(y)
+    
+    # Equivalent to R_z(y) @ R_y(p) @ R_x(r)
+    # Minimizing overhead by explicitly writing out the 3×3
+    return np.array([
+        [cy*cp,            cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
+        [sy*cp,            sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
+        [   -sp,                     cp*sr,               cp*cr]
+    ])
+
+def inverse_kinematics(chain, px, py, pz, roll_deg, pitch_deg, yaw_deg, q_init):
+    """Compute IK solution given position and RPY.  Return joint angles (rad)."""
+    target_pos = [px, py, pz]
+    target_rot = rpy_to_matrix(roll_deg, pitch_deg, yaw_deg)
+    # IKPy requires an initial guess array with length = #links, so add a zero at start
+    init_guess = [0] + list(q_init)
+    sol = chain.inverse_kinematics(
+        target_position=target_pos,
+        target_orientation=target_rot,
+        initial_position=init_guess,
+        orientation_mode="all"
+    )
+    # Return only the 6 real joints
+    return sol[1:]
+
+#############################################################################
+# 4) Minimal VPython UI
+#############################################################################
+scene = canvas(title="UR10 Actuator Sliders and Joint Angles", width=400, height=300)
+scene.caption = "\n"
+
+scene.append_to_caption("=== UR10 Sliders (12-bit output) ===\n\n")
+
+scene.append_to_caption("x: ")
+text_x = wtext(text="0.00 ")
+slider_x = slider(min=-0.5, max=0.5, value=0.0, step=0.01,
+                  bind=lambda s: setattr(text_x, "text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("y: ")
+text_y = wtext(text="0.00 ")
+slider_y = slider(min=-0.5, max=0.5, value=0.0, step=0.01,
+                  bind=lambda s: setattr(text_y, "text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("z: ")
+text_z = wtext(text="0.30 ")
+slider_z = slider(min=0.0, max=1.0, value=0.3, step=0.01,
+                  bind=lambda s: setattr(text_z, "text", f"{s.value:.2f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("roll (deg): ")
+text_roll = wtext(text="0 ")
+slider_roll = slider(min=-180, max=180, value=0, step=1,
+                     bind=lambda s: setattr(text_roll, "text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("pitch (deg): ")
+text_pitch = wtext(text="0 ")
+slider_pitch = slider(min=-180, max=180, value=0, step=1,
+                      bind=lambda s: setattr(text_pitch, "text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("yaw (deg): ")
+text_yaw = wtext(text="0 ")
+slider_yaw = slider(min=-180, max=180, value=0, step=1,
+                    bind=lambda s: setattr(text_yaw, "text", f"{s.value:.0f}"))
+scene.append_to_caption("\n\n")
+
+scene.append_to_caption("=== Joint Angles (12-bit) ===\n\n")
+joint_texts = [wtext(text=f"J{i+1} = 0\n") for i in range(6)]
+
+#############################################################################
+# 5) Initialize variables and UART
+#############################################################################
+current_q = np.zeros(6)
+
+try:
+    ser = serial.Serial(port='/dev/serial0', baudrate=115200, timeout=0.01)
+    print("UART port opened successfully.")
+except Exception as e:
+    ser = None
+    print("Warning: Could not open UART port:", e)
+
+print("UR10 Actuator Control loaded. Adjust sliders to change target pose.\n")
+
+#############################################################################
+# 6) Main loop
+#############################################################################
+def sliders_changed(prev, curr, eps=1e-9):
+    """Check if any slider value changed enough to warrant re-calculation."""
+    return (abs(curr[0] - prev[0]) > eps or
+            abs(curr[1] - prev[1]) > eps or
+            abs(curr[2] - prev[2]) > eps or
+            abs(curr[3] - prev[3]) > eps or
+            abs(curr[4] - prev[4]) > eps or
+            abs(curr[5] - prev[5]) > eps)
+
+prev_target = (0,0,0,0,0,0)
+
+# Local references to reduce overhead on each loop
+inv_kin = inverse_kinematics
+r2_12b = rad_to_12bit
+
+try:
+    while True:
+        rate(20)  # ~20 Hz
+
+        # Read slider values
+        px = slider_x.value
+        py = slider_y.value
+        pz = slider_z.value
+        rdeg = slider_roll.value
+        pdeg = slider_pitch.value
+        ydeg = slider_yaw.value
+
+        current_target = (px, py, pz, rdeg, pdeg, ydeg)
+
+        # Only run IK if any slider changed
+        if sliders_changed(prev_target, current_target):
+            prev_target = current_target
+
+            # Solve IK
+            new_q = inv_kin(robot_chain, px, py, pz, rdeg, pdeg, ydeg, current_q)
+            current_q = new_q  # store as the new "current" angles
+
+            # Convert each radian joint angle to 12-bit
+            joint_12bit = [r2_12b(a) for a in current_q]
+
+            # Update displayed text
+            for i in range(6):
+                joint_texts[i].text = f"J{i+1} = {joint_12bit[i]:4d}\n"
+
+            # If UART is open, send data
+            if ser and ser.is_open:
+                # Minimal string assembly
+                data_str = (
+                    "mac=;"
+                    f"h1X={joint_12bit[0]};"
+                    f"h1Y={joint_12bit[1]};"
+                    f"h1Z={joint_12bit[2]};"
+                    f"h1p={joint_12bit[3]};"
+                    f"h1y={joint_12bit[4]};"
+                    f"h1r={joint_12bit[5]};"
+                    "h2X=0;h2Y=0;h2Z=0;h2p=0;h2y=0;h2r=0;"
+                    "f=0;b=0;l=0;r=0;u=0;d=0\n"
+                )
+                # Comment out frequent printing to speed up
+                # print("Sending:", data_str)
+                ser.write(data_str.encode('utf-8'))
+
+        # Read any incoming data in one shot (instead of line-by-line loop)
+        if ser and ser.is_open and ser.in_waiting:
+            try:
+                echoed = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                if echoed.strip():
+                    # Only print if you really need the debug info
+                    # print("Echoed from ESP32:", echoed.strip())
+                    pass
+            except Exception as e:
+                print("Error reading echoed data:", e)
+
+except KeyboardInterrupt:
+    print("Interrupted by user.")
+    if ser and ser.is_open:
+        ser.close()
+    sys.exit(0)
