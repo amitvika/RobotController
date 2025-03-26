@@ -1,152 +1,190 @@
-  #include <Arduino.h>
-  #include <WiFi.h>
-  #include <esp_wifi.h>
-  #include <esp_now.h>
-  #include <ArduinoJson.h>
-  #include <Wire.h>
-  #include <Adafruit_BusIO_Register.h>
-  #include <Adafruit_Sensor.h>
-  #include <HTTPClient.h>
-  #include <math.h> // for roundf()
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_BusIO_Register.h>
 #include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <string.h>
 
-//----------------------------------------------------------------------
-// Uncomment the following line to use UART communication (e.g. with an external
-// device connected to Serial1). Comment it out to use the USB serial (Serial)
-// for communication with a computer.
-//----------------------------------------------------------------------
-//#define COMM_MODE_UART
+// -------------------- Pin Configuration --------------------
+const int HIGH_PINS[]   = {4, 32, 21, 19};
+const int LOW_PINS[]    = {16, 26};
+const int PWM_PINS_1[2] = {25, 27};  // Left motor: forward/backward
+const int PWM_PINS_2[2] = {21, 22};  // Right motor: forward/backward
 
-// ------------------- Communication Config -------------------
-#ifdef COMM_MODE_UART
-  #define UART_BAUD_RATE   115200  // Adjust as needed
-  #define MAX_LINE_LENGTH  256
-  // Define UART1 TX/RX pins (adjust according to your wiring)
-  #define UART_TX_PIN 17
-  #define UART_RX_PIN 16
-#endif
+// -------------------- Navigation Command Variables --------------------
+int forwardCmd  = 0;   // Expected range: 0 to 100
+int backwardCmd = 0;   // Expected range: 0 to 100
+int leftCmd     = 0;   // Expected range: 0 to 100
+int rightCmd    = 0;   // Expected range: 0 to 100
 
-// Create a pointer for the communication port (either Serial1 or Serial)
-Stream* commPort;
+// Maximum PWM value for LEDC (8-bit resolution)
+const int MAX_PWM = 150;
 
-// ------------------- SLAVE MAC ADDRESSES --------------------
-// (Replace these MAC addresses as needed)
-uint8_t slave1MAC[] = {0x78, 0xEE, 0x4C, 0x11, 0x31, 0x8C}; // wheels
-uint8_t slave2MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x00}; // neck
-uint8_t slave3MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x64}; // neck
-uint8_t slave4MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x68}; // IK arm 1, actuator 6
-uint8_t slave5MAC[] = {0xF8, 0xB3, 0xB7, 0xD2, 0x3B, 0x54}; // IK arm 1, actuator 2
-uint8_t slave6MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave7MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave8MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave9MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave10MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave11MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave12MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave13MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
-uint8_t slave14MAC[] = {0x08, 0xA6, 0xF7, 0xB0, 0x72, 0x1C};
+// -------------------- Motor Reversal Flags --------------------
+bool reverseLeftMotor  = true;  // Set to true if left motor should be reversed
+bool reverseRightMotor = false;  // Set to true if right motor should be reversed
 
-uint8_t* slaves[] = { slave1MAC, slave2MAC, slave3MAC, slave4MAC,
-                      slave5MAC, slave6MAC, slave7MAC, slave8MAC,
-                      slave9MAC, slave10MAC, slave11MAC, slave12MAC,
-                      slave13MAC, slave14MAC };
-static const int numSlaves = 14;
+// -------------------- ESP-NOW Buffer --------------------
+#define MAX_BUFFER_SIZE 256
 
-// Track which peers were successfully added
-bool peerAdded[numSlaves] = { false };
-
-// ------------------- ESPNOW CALLBACK ----------------
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Optionally, add code here if you need to track success or failure.
+// -------------------- Parse Navigation Commands --------------------
+// Expected string format: "f=XX;b=YY;l=ZZ;r=AA;" where XX, YY, ZZ, AA ∈ [0, 100]
+void parseNavigationLine(char* txt) {
+  // Reset all commands
+  forwardCmd  = 0;
+  backwardCmd = 0;
+  leftCmd     = 0;
+  rightCmd    = 0;
+  
+  char* token = strtok(txt, ";");
+  while (token != NULL) {
+    if (strncmp(token, "f=", 2) == 0) {
+      forwardCmd = atoi(token + 2);
+    } else if (strncmp(token, "b=", 2) == 0) {
+      backwardCmd = atoi(token + 2);
+    } else if (strncmp(token, "l=", 2) == 0) {
+      leftCmd = atoi(token + 2);
+    } else if (strncmp(token, "r=", 2) == 0) {
+      rightCmd = atoi(token + 2);
+    }
+    token = strtok(NULL, ";");
+  }
+  
+  // Optional debug print:
+  Serial.print("Commands: f=");
+  Serial.print(forwardCmd);
+  Serial.print(" b=");
+  Serial.print(backwardCmd);
+  Serial.print(" l=");
+  Serial.print(leftCmd);
+  Serial.print(" r=");
+  Serial.println(rightCmd);
 }
 
-// ------------------- SETUP --------------------------
+// -------------------- ESP-NOW Callback --------------------
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  if(len <= 0) return;
+  char buffer[MAX_BUFFER_SIZE];
+  int copyLen = (len < MAX_BUFFER_SIZE - 1) ? len : MAX_BUFFER_SIZE - 1;
+  memcpy(buffer, incomingData, copyLen);
+  buffer[copyLen] = '\0';
+  parseNavigationLine(buffer);
+}
+
+// -------------------- Motor PWM Function --------------------
+// command: value in the range -100 (full reverse) to +100 (full forward)
+// reverse: if true, invert the command.
+void setMotorPWM(int forwardChannel, int backwardChannel, bool reverse, int command) {
+  if(reverse) {
+    command = -command;
+  }
+  
+  int pwmValue = 0;
+  if (command >= 0) {
+    // Forward command: map 0 to 100 to 0 to MAX_PWM
+    pwmValue = map(command, 0, 100, 0, MAX_PWM);
+    ledcWrite(forwardChannel, pwmValue);
+    ledcWrite(backwardChannel, 0);
+  } else {
+    // Reverse command: map 0 to 100 (absolute value) to 0 to MAX_PWM
+    pwmValue = map(-command, 0, 100, 0, MAX_PWM);
+    ledcWrite(forwardChannel, 0);
+    ledcWrite(backwardChannel, pwmValue);
+  }
+}
+
+// -------------------- Setup PWM --------------------
+void setupPinsAndPWMs() {
+  // Configure HIGH and LOW pins if needed.
+  for (unsigned i = 0; i < sizeof(HIGH_PINS)/sizeof(HIGH_PINS[0]); i++) {
+    pinMode(HIGH_PINS[i], OUTPUT);
+    digitalWrite(HIGH_PINS[i], HIGH);
+  }
+  for (unsigned i = 0; i < sizeof(LOW_PINS)/sizeof(LOW_PINS[0]); i++) {
+    pinMode(LOW_PINS[i], OUTPUT);
+    digitalWrite(LOW_PINS[i], LOW);
+  }
+  
+  // Set up LEDC channels (8-bit resolution, 5000 Hz)
+  ledcSetup(0, 5000, 8); // Left motor forward
+  ledcSetup(1, 5000, 8); // Left motor reverse
+  ledcSetup(2, 5000, 8); // Right motor forward
+  ledcSetup(3, 5000, 8); // Right motor reverse
+  
+  ledcAttachPin(PWM_PINS_1[0], 0);
+  ledcAttachPin(PWM_PINS_1[1], 1);
+  ledcAttachPin(PWM_PINS_2[0], 2);
+  ledcAttachPin(PWM_PINS_2[1], 3);
+}
+
+// -------------------- Motor Control Logic --------------------
+// Compute motor commands from navigation values and immediately set PWM.
+// A simple differential drive is implemented as:
+//    drive = (forward - backward)
+//    turn  = (right - left)
+//    leftMotorCmd  = drive + turn
+//    rightMotorCmd = drive - turn
+void controlMotors() {
+  int drive = forwardCmd - backwardCmd;   // Range: -100 to 100
+  int turn  = rightCmd - leftCmd;           // Range: -100 to 100
+  
+  int leftMotorCmd  = drive + turn;   // Left motor command
+  int rightMotorCmd = drive - turn;   // Right motor command
+  
+  // Clamp commands to [-100, 100]
+  leftMotorCmd  = constrain(leftMotorCmd, -100, 100);
+  rightMotorCmd = constrain(rightMotorCmd, -100, 100);
+  
+  // Set motor speeds immediately (no ramping)
+  setMotorPWM(0, 1, reverseLeftMotor, leftMotorCmd);    // Left motor: channels 0 (forward) & 1 (reverse)
+  setMotorPWM(2, 3, reverseRightMotor, rightMotorCmd);   // Right motor: channels 2 (forward) & 3 (reverse)
+  
+  // Optional debug output:
+  Serial.print("Left Motor Cmd: ");
+  Serial.print(leftMotorCmd);
+  Serial.print(" | Right Motor Cmd: ");
+  Serial.println(rightMotorCmd);
+}
+
+// -------------------- ESP-NOW Setup --------------------
+void setupESPNow() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init error!");
+    while (1) { delay(1000); }
+  }
+  esp_now_register_recv_cb(onDataRecv);
+}
+
 void setup() {
-  // Initialize the chosen communication port:
-  #ifdef COMM_MODE_UART
-    Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-    commPort = &Serial1;
-  #else
-    Serial.begin(115200);
-    commPort = &Serial;
-  #endif
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("ESP-NOW Receiver with Motor Control (0-100 Commands)");
 
-  // Allow some time for the serial connection to initialize.
-  delay(100);
-
-  // Set Wi-Fi mode to STA and disable power saving for low-latency ESPNOW.
+  setupPinsAndPWMs();
+  
+  // Set WiFi to STA mode and disable power saving.
   WiFi.mode(WIFI_STA);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.disconnect();
-
-  // Initialize ESPNOW.
-  if (esp_now_init() == ESP_OK) {
-    esp_now_register_send_cb(onDataSent);
-
-    // Add each slave as an ESPNOW peer.
-    for (int i = 0; i < numSlaves; i++) {
-      esp_now_peer_info_t peerInfo = {};
-      memcpy(peerInfo.peer_addr, slaves[i], 6);
-      peerInfo.channel = 0;   // Use the same channel as the master.
-      peerInfo.encrypt = false;
-
-      if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-        peerAdded[i] = true;
-      }
-    }
-  } else {
-    commPort->println("Error initializing ESPNOW");
-  }
+  
+  setupESPNow();
+  
+  Serial.print("Receiver MAC Address: ");
+  Serial.println(WiFi.macAddress());
 }
 
-// ------------------- MAIN LOOP ----------------------
 void loop() {
-  // Define a buffer for incoming data.
-  #ifdef COMM_MODE_UART
-    static char buffer[MAX_LINE_LENGTH];
-  #else
-    static char buffer[256];
-  #endif
-  static int idx = 0;
-
-  // Continuously check if data is available on the chosen communication port.
-  while (commPort->available() > 0) {
-    char c = (char)commPort->read();
-
-    if (c == '\n') {
-      // End-of-line received. Terminate the string.
-      buffer[idx] = '\0';
-
-      // Echo the received string back so the sender can see it.
-      commPort->print(buffer);
-      commPort->print("\n");
-
-      // Send the received data via ESPNOW to all configured peers.
-      if (idx > 0) {
-        for (int i = 0; i < numSlaves; i++) {
-          if (peerAdded[i]) {
-            esp_now_send(slaves[i], (uint8_t*)buffer, idx + 1);
-          }
-        }
-      }
-      // Reset the buffer index for the next message.
-      idx = 0;
-    } 
-    else {
-      // Accumulate incoming characters until a newline is encountered.
-      if (idx < (int)(sizeof(buffer) - 1)) {
-        buffer[idx++] = c;
-      } else {
-        // If the buffer overflows, reset the index.
-        idx = 0;
-      }
-    }
-  }
-  // Loop continuously without delay.
+  controlMotors();
+  delay(10);
 }
