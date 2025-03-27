@@ -14,44 +14,48 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <string.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
 
 // -------------------- Pin Configuration --------------------
-const int POWER_PIN     = 25; // This pin is set HIGH by default
-const int MOTOR_FWD_PIN = 21;
-const int MOTOR_BWD_PIN = 22;
+const int POWER_PIN     = 12; // This pin is set HIGH by default
+const int MOTOR_FWD_PIN = 13;
+const int MOTOR_BWD_PIN = 14;
 
 // -------------------- Direction Control Variable --------------------
 bool reverseMotor = true; // If wiring requires reversing up/down logic
 
 // -------------------- Speed Control --------------------
 const int MAX_PWM    = 255;
-const int ACTIVE_PWM = 200; // ~170–200
+const int ACTIVE_PWM = 255;
 
 // -------------------- Command Flags --------------------
 bool upCmd   = false;
 bool downCmd = false;
 
 // ------------------------------------------------------------------
-// parseKeyValueLine: "markerId=hands;up=1;down=0;..."
-//
-// We'll ignore everything except "up=..." and "down=..." for controlling
+// parseKeyValueLine: 
+// e.g. "mac=asd;h1X=0;...;u=1;d=0;"
+// We'll ignore everything except "u=..." and "d=..." for controlling
 // the motor. If you want to parse more fields, you can extend this function.
 // ------------------------------------------------------------------
 void parseKeyValueLine(char* line) {
     // Split by semicolons
     char* token = strtok(line, ";");
     while (token != NULL) {
-        // Look for '='
+        // Look for '=' in the current token
         char* eqPos = strchr(token, '=');
         if (eqPos) {
-            *eqPos = '\0';     // Split
+            *eqPos = '\0';  // Null-terminate at '='
             char* key = token;
             char* val = eqPos + 1;
 
-            // Compare keys
-            if (!strcmp(key, "up")) {
-                upCmd   = (atoi(val) == 1);
-            } else if (!strcmp(key, "down")) {
+            // Compare keys to see if they are "u" or "d"
+            if (!strcmp(key, "u")) {
+                upCmd = (atoi(val) == 1);
+            } 
+            else if (!strcmp(key, "d")) {
                 downCmd = (atoi(val) == 1);
             }
         }
@@ -88,7 +92,7 @@ void setMotorDirectionAndSpeed(bool up, bool down, bool reverse) {
     int forwardVal  = 0;
     int backwardVal = 0;
 
-    // Decide direction
+    // Decide direction. If reverseMotor == true, swap up/down signals
     bool motorForward  = up;
     bool motorBackward = down;
     if (reverse) {
@@ -159,7 +163,7 @@ void setup() {
 }
 
 void loop() {
-  // Just respond to commands in real-time, no ramping logic here
+  // Apply motor commands based on upCmd/downCmd
   setMotorDirectionAndSpeed(upCmd, downCmd, reverseMotor);
 
   // Minimal loop delay

@@ -29,7 +29,7 @@ int leftCmd     = 0;   // Expected range: 0 to 100
 int rightCmd    = 0;   // Expected range: 0 to 100
 
 // Maximum PWM value for LEDC (8-bit resolution)
-const int MAX_PWM = 175;
+const int MAX_PWM = 150;
 
 // -------------------- Motor Reversal Flags --------------------
 bool reverseLeftMotor  = true;  // Set to true if left motor should be reversed

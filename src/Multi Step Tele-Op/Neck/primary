@@ -3,15 +3,6 @@
 #include <esp_wifi.h>
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
-#include <Arduino.h>
-#include <WiFi.h>
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <ArduinoWebsockets.h>
-#include <ArduinoJson.h>
-#include <Arduino.h>
-#include <WiFi.h>
 #include <esp_now.h>
 #include <string.h>
 #include <Wire.h>
@@ -27,18 +18,16 @@ const int MOTOR_BWD_PIN = 14;
 bool reverseMotor = true; // If wiring requires reversing up/down logic
 
 // -------------------- Speed Control --------------------
-const int MAX_PWM    = 255;
-const int ACTIVE_PWM = 255;
+const int ACTIVE_PWM = 255; // PWM range maximum
 
-// -------------------- Command Flags --------------------
-bool upCmd   = false;
-bool downCmd = false;
+// -------------------- Command Values --------------------
+int upCmd   = 0; // Now holds a value between 0 and 100
+int downCmd = 0;
 
 // ------------------------------------------------------------------
 // parseKeyValueLine: 
-// e.g. "mac=asd;h1X=0;...;u=1;d=0;"
-// We'll ignore everything except "u=..." and "d=..." for controlling
-// the motor. If you want to parse more fields, you can extend this function.
+// e.g. "mac=asd;h1X=0;...;u=50;d=0;"
+// Only "u" and "d" are parsed for motor control.
 // ------------------------------------------------------------------
 void parseKeyValueLine(char* line) {
     // Split by semicolons
@@ -47,22 +36,21 @@ void parseKeyValueLine(char* line) {
         // Look for '=' in the current token
         char* eqPos = strchr(token, '=');
         if (eqPos) {
-            *eqPos = '\0';  // Null-terminate at '='
+            *eqPos = '\0';  // Terminate key string at '='
             char* key = token;
             char* val = eqPos + 1;
 
-            // Compare keys to see if they are "u" or "d"
             if (!strcmp(key, "u")) {
-                upCmd = (atoi(val) == 1);
+                upCmd = atoi(val);   // Expect a value between 0 and 100
             } 
             else if (!strcmp(key, "d")) {
-                downCmd = (atoi(val) == 1);
+                downCmd = atoi(val); // Expect a value between 0 and 100
             }
         }
         token = strtok(NULL, ";");
     }
 
-    // Debug (optional)
+    // Optional debugging output
     Serial.print("Commands => up=");
     Serial.print(upCmd);
     Serial.print(", down=");
@@ -81,80 +69,81 @@ void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
     memcpy(buffer, incomingData, copyLen);
     buffer[copyLen] = '\0';
 
-    // We'll parse the entire buffer as one line
+    // Parse the entire buffer as one line
     parseKeyValueLine(buffer);
 }
 
 // ------------------------------------------------------------------
-// Motor direction + speed
+// Motor direction + proportional speed control
 // ------------------------------------------------------------------
-void setMotorDirectionAndSpeed(bool up, bool down, bool reverse) {
+void setMotorDirectionAndSpeed(int up, int down, bool reverse) {
     int forwardVal  = 0;
     int backwardVal = 0;
 
-    // Decide direction. If reverseMotor == true, swap up/down signals
-    bool motorForward  = up;
-    bool motorBackward = down;
+    // Adjust for reverse wiring if needed by swapping the command values
+    int upValue = up;
+    int downValue = down;
     if (reverse) {
-        motorForward  = down;
-        motorBackward = up;
+        int temp = upValue;
+        upValue = downValue;
+        downValue = temp;
     }
 
-    if (motorForward && !motorBackward) {
-        forwardVal  = ACTIVE_PWM;
+    // Determine motor speed based on commands:
+    // - If only one direction is active, map the command (0-100) to PWM (0-255)
+    // - If both commands are active or both are zero, stop the motor.
+    if (upValue > 0 && downValue == 0) {
+        forwardVal = map(upValue, 0, 100, 0, ACTIVE_PWM);
         backwardVal = 0;
     } 
-    else if (motorBackward && !motorForward) {
-        forwardVal  = 0;
-        backwardVal = ACTIVE_PWM;
+    else if (downValue > 0 && upValue == 0) {
+        forwardVal = 0;
+        backwardVal = map(downValue, 0, 100, 0, ACTIVE_PWM);
     } 
     else {
-        // Stop
+        // When both directions are commanded or neither, stop the motor.
         forwardVal  = 0;
         backwardVal = 0;
     }
 
+    // Write the PWM values to the motor channels
     ledcWrite(0, forwardVal);
     ledcWrite(1, backwardVal);
 }
 
 // ------------------------------------------------------------------
-// Setup pins and PWM
+// Setup pins and PWM channels
 // ------------------------------------------------------------------
 void setupPinsAndPWMs() {
-  // Power pin
   pinMode(POWER_PIN, OUTPUT);
   digitalWrite(POWER_PIN, HIGH);
 
-  // PWM pins
   pinMode(MOTOR_FWD_PIN, OUTPUT);
   pinMode(MOTOR_BWD_PIN, OUTPUT);
 
-  // Setup LEDC channels for forward/back
-  ledcSetup(0, 5000, 8); // forward channel
-  ledcSetup(1, 5000, 8); // backward channel
+  // Setup PWM channels (LEDC)
+  ledcSetup(0, 5000, 8); // Channel 0 for forward direction
+  ledcSetup(1, 5000, 8); // Channel 1 for backward direction
 
   ledcAttachPin(MOTOR_FWD_PIN, 0);
   ledcAttachPin(MOTOR_BWD_PIN, 1);
 
-  // Initially stop
+  // Initially stop the motor
   ledcWrite(0, 0);
   ledcWrite(1, 0);
 }
 
 void setup() {
   Serial.begin(115200);
-
   setupPinsAndPWMs();
 
-  // Wi-Fi not used for normal connection here, but needed for ESP-NOW
+  // Wi-Fi mode set for ESP-NOW (no normal Wi-Fi connection)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
   }
-
   esp_now_register_recv_cb(onDataRecv);
 
   Serial.print("Slave MAC Address: ");
@@ -163,9 +152,7 @@ void setup() {
 }
 
 void loop() {
-  // Apply motor commands based on upCmd/downCmd
+  // Apply motor commands based on the current upCmd and downCmd values
   setMotorDirectionAndSpeed(upCmd, downCmd, reverseMotor);
-
-  // Minimal loop delay
   delay(1);
 }
