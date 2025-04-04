@@ -7,6 +7,13 @@
 #include <Adafruit_BusIO_Register.h>
 #include <Adafruit_Sensor.h>
 #include <HTTPClient.h>
+#include <math.h> // for roundf()
+#include <Arduino.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -22,11 +29,11 @@
 // ------------------------- PIN DEFINITIONS -------------------------
 #define SDA_PIN_SENSOR   21
 #define SCL_PIN_SENSOR   22
-#define MOTOR_CTRL_PIN1  14
-#define MOTOR_CTRL_PIN2  13
+#define MOTOR_CTRL_PIN1  13
+#define MOTOR_CTRL_PIN2  14
 #define MOTOR_ENABLE_PIN 12 //12 on 5 off
 #define AS5600_ADDRESS   0x36
-#define ACTUATOR_CENTER 1655  // Use 3750 as the working center position if needed
+#define ACTUATOR_CENTER 2354  // Use 3750 as the working center position if needed
 
 // ---------------------- CONTROL PARAMETERS -------------------------
 uint16_t desiredPosition = ACTUATOR_CENTER;  // Initialize desired position at virtual zero
@@ -36,7 +43,12 @@ int positionErrorAllowance = 1;
 int deadZone = 20;
 
 // ------------------- DIRECTION INVERSION VARIABLE -------------------------
-bool invertDirection = false; // Set to true to enable direction inversion
+bool invertDirection = true; // Set to true to enable direction inversion
+
+// ------------------- MOTION LIMITS -------------------------
+// Define safe operating limits for the sensor angle.
+const uint16_t ANGLE_MIN = 1000;
+const uint16_t ANGLE_MAX = 3721;
 
 // ------------------- REMAP FUNCTION ---------------------
 // Remaps a working position value to the actual sensor position,
@@ -153,7 +165,7 @@ void parseActuatorValueLine(char* line) {
       *eqPos = '\0';
       char* key = token;
       char* val = eqPos + 1;
-      if (strcmp(key, "h1Z") == 0) {
+      if (strcmp(key, "h1Y") == 0) {
         // Get the raw working position from the received string.
         uint16_t workingPosition = (uint16_t)atoi(val);
         Serial.print("Raw working position received: ");
@@ -162,6 +174,12 @@ void parseActuatorValueLine(char* line) {
         // Remap the working position to the actual sensor position.
         desiredPosition = remapPosition(workingPosition);
         
+        // Clamp desiredPosition to safe limits.
+        if (desiredPosition > ANGLE_MAX) {
+          desiredPosition = ANGLE_MAX;
+        } else if (desiredPosition < ANGLE_MIN) {
+          desiredPosition = ANGLE_MIN;
+        }
         Serial.print("Updated desiredPosition (remapped h1Y): ");
         Serial.println(desiredPosition);
       }
@@ -197,7 +215,11 @@ void loop() {
   uint16_t angle = readAS5600Angle();
   int targetPWM  = computeTargetPWM(angle, desiredPosition);
 
-  // No limits check is performed here. The motor is driven based solely on the computed PWM.
+  // Prevent actuator motion beyond safe limits.
+  if ((angle >= ANGLE_MAX && targetPWM > 0) || (angle <= ANGLE_MIN && targetPWM < 0)) {
+    targetPWM = 0;
+  }
+
   applyPWM(targetPWM);
 
   Serial.print("Angle: ");
