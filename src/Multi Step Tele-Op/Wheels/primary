@@ -2,7 +2,23 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
-#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+ 
 #include <Wire.h>
 #include <Adafruit_BusIO_Register.h>
 #include <Adafruit_Sensor.h>
@@ -17,10 +33,10 @@
 #include <string.h>
 
 // -------------------- Pin Configuration --------------------
-const int HIGH_PINS[]   = {4, 32, 21, 19};
+const int HIGH_PINS[]   = {4, 19, 32,21};
 const int LOW_PINS[]    = {16, 26};
-const int PWM_PINS_1[2] = {25, 27};  // Left motor: forward/backward
-const int PWM_PINS_2[2] = {21, 22};  // Right motor: forward/backward
+const int PWM_PINS_1[2] = {23, 33};  // Left motor: forward/backward
+const int PWM_PINS_2[2] = {25, 22};  // Right motor: forward/backward
 
 // -------------------- Navigation Command Variables --------------------
 int forwardCmd  = 0;   // Expected range: 0 to 100
